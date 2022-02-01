@@ -3,6 +3,7 @@ use crate::ready;
 use crate::util::target_addr::{read_address, TargetAddr};
 use crate::{consts, AuthenticationMethod, ReplyError, Result, SocksError};
 use anyhow::Context;
+use futures::future::BoxFuture;
 use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs as StdToSocketAddrs};
@@ -16,25 +17,25 @@ use tokio::time::timeout;
 use tokio_stream::{Stream, StreamExt};
 
 #[derive(Clone)]
-pub struct Config {
+pub struct Config<T: AsyncRead + AsyncWrite + Unpin> {
     /// Timeout of the command request
     request_timeout: u64,
     /// Avoid useless roundtrips if we don't need the Authentication layer
     skip_auth: bool,
     /// Enable dns-resolving
     dns_resolve: bool,
-    /// Enable command execution
-    execute_command: bool,
+    /// Command executer. If None, use the default implementation.
+    command_executer: Option<Arc<CommandExecutor<T>>>,
     auth: Option<Arc<dyn Authentication>>,
 }
 
-impl Default for Config {
+impl<T: AsyncRead + AsyncWrite + Unpin> Default for Config<T> {
     fn default() -> Self {
         Config {
             request_timeout: 10,
             skip_auth: false,
             dns_resolve: true,
-            execute_command: true,
+            command_executer: None,
             auth: None,
         }
     }
@@ -57,7 +58,7 @@ impl Authentication for SimpleUserPassword {
     }
 }
 
-impl Config {
+impl<S: AsyncRead + AsyncWrite + Unpin> Config<S> {
     /// How much time it should wait until the request timeout.
     pub fn set_request_timeout(&mut self, n: u64) -> &mut Self {
         self.request_timeout = n;
@@ -83,8 +84,8 @@ impl Config {
     }
 
     /// Set whether or not to execute commands
-    pub fn set_execute_command(&mut self, value: bool) -> &mut Self {
-        self.execute_command = value;
+    pub fn set_execute_command(&mut self, value: CommandExecutor<S>) -> &mut Self {
+        self.command_executer = Some(Arc::new(value));
         self
     }
 
@@ -99,7 +100,7 @@ impl Config {
 /// Useful if you don't use any existing TcpListener's streams.
 pub struct Socks5Server {
     listener: TcpListener,
-    config: Arc<Config>,
+    config: Arc<Config<TcpStream>>,
 }
 
 impl Socks5Server {
@@ -111,7 +112,7 @@ impl Socks5Server {
     }
 
     /// Set a custom config
-    pub fn set_config(&mut self, config: Config) {
+    pub fn set_config(&mut self, config: Config<TcpStream>) {
         self.config = Arc::new(config);
     }
 
@@ -163,13 +164,13 @@ impl<'a> Stream for Incoming<'a> {
 /// Wrap TcpStream and contains Socks5 protocol implementation.
 pub struct Socks5Socket<T: AsyncRead + AsyncWrite + Unpin> {
     inner: T,
-    config: Arc<Config>,
+    config: Arc<Config<T>>,
     auth: AuthenticationMethod,
     target_addr: Option<TargetAddr>,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Socks5Socket<T> {
-    pub fn new(socket: T, config: Arc<Config>) -> Self {
+    pub fn new(socket: T, config: Arc<Config<T>>) -> Self {
         Socks5Socket {
             inner: socket,
             config,
@@ -380,8 +381,31 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Socks5Socket<T> {
             debug!("Domain won't be resolved because `dns_resolve`'s config has been turned off.")
         }
 
-        if self.config.execute_command {
-            self.execute_command().await?;
+        match &self.config.command_executer {
+            Some(f) => {
+                f(
+                    self.target_addr
+                        .as_ref()
+                        .context("target_addr empty")?
+                        .to_owned(),
+                    self.config.request_timeout,
+                    &mut self.inner,
+                )
+                .await?;
+            }
+            None => {
+                execute_command(
+                    self.target_addr
+                        .as_ref()
+                        .context("target_addr empty")?
+                        .to_socket_addrs()?
+                        .next()
+                        .context("unreachable")?,
+                    self.config.request_timeout,
+                    &mut self.inner,
+                )
+                .await?;
+            }
         }
 
         Ok(())
@@ -477,73 +501,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Socks5Socket<T> {
         Ok(())
     }
 
-    /// Connect to the target address that the client wants,
-    /// then forward the data between them (client <=> target address).
-    async fn execute_command(&mut self) -> Result<()> {
-        // async-std's ToSocketAddrs doesn't supports external trait implementation
-        // @see https://github.com/async-rs/async-std/issues/539
-        let addr = self
-            .target_addr
-            .as_ref()
-            .context("target_addr empty")?
-            .to_socket_addrs()?
-            .next()
-            .context("unreachable")?;
-
-        let fut = TcpStream::connect(addr);
-        let limit = Duration::from_secs(self.config.request_timeout);
-
-        // TCP connect with timeout, to avoid memory leak for connection that takes forever
-        let outbound = match timeout(limit, fut).await {
-            Ok(e) => match e {
-                Ok(o) => o,
-                Err(e) => match e.kind() {
-                    // Match other TCP errors with ReplyError
-                    io::ErrorKind::ConnectionRefused => {
-                        return Err(ReplyError::ConnectionRefused.into())
-                    }
-                    io::ErrorKind::ConnectionAborted => {
-                        return Err(ReplyError::ConnectionNotAllowed.into())
-                    }
-                    io::ErrorKind::ConnectionReset => {
-                        return Err(ReplyError::ConnectionNotAllowed.into())
-                    }
-                    io::ErrorKind::NotConnected => {
-                        return Err(ReplyError::NetworkUnreachable.into())
-                    }
-                    _ => return Err(e.into()), // #[error("General failure")] ?
-                },
-            },
-            // Wrap timeout error in a proper ReplyError
-            Err(_) => return Err(ReplyError::TtlExpired.into()),
-        };
-
-        debug!("Connected to remote destination");
-
-        // TODO: convert this to the real address
-        self.inner
-            .write(&[
-                consts::SOCKS5_VERSION,
-                consts::SOCKS5_REPLY_SUCCEEDED,
-                0x00, // reserved
-                1,    // address type (ipv4, v6, domain)
-                127,  // ip
-                0,
-                0,
-                1,
-                0, // port
-                0,
-            ])
-            .await
-            .context("Can't write successful reply")?;
-
-        self.inner.flush().await.context("Can't flush the reply!")?;
-
-        debug!("Wrote success");
-
-        transfer(&mut self.inner, outbound).await
-    }
-
     pub fn target_addr(&self) -> Option<&TargetAddr> {
         self.target_addr.as_ref()
     }
@@ -553,9 +510,70 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Socks5Socket<T> {
     }
 }
 
+pub type CommandExecutor<T> =
+    Box<dyn Fn(TargetAddr, u64, &mut T) -> BoxFuture<Result<()>> + Send + Sync>;
+/// Connect to the target address that the client wants,
+/// then forward the data between them (client <=> target address).
+async fn execute_command<T: AsyncRead + AsyncWrite + Unpin>(
+    target_addr: SocketAddr,
+    request_timeout: u64,
+    reply_sock: &mut T,
+) -> Result<()> {
+    let fut = TcpStream::connect(target_addr);
+    let limit = Duration::from_secs(request_timeout);
+
+    // TCP connect with timeout, to avoid memory leak for connection that takes forever
+    let outbound = match timeout(limit, fut).await {
+        Ok(e) => match e {
+            Ok(o) => o,
+            Err(e) => match e.kind() {
+                // Match other TCP errors with ReplyError
+                io::ErrorKind::ConnectionRefused => {
+                    return Err(ReplyError::ConnectionRefused.into())
+                }
+                io::ErrorKind::ConnectionAborted => {
+                    return Err(ReplyError::ConnectionNotAllowed.into())
+                }
+                io::ErrorKind::ConnectionReset => {
+                    return Err(ReplyError::ConnectionNotAllowed.into())
+                }
+                io::ErrorKind::NotConnected => return Err(ReplyError::NetworkUnreachable.into()),
+                _ => return Err(e.into()), // #[error("General failure")] ?
+            },
+        },
+        // Wrap timeout error in a proper ReplyError
+        Err(_) => return Err(ReplyError::TtlExpired.into()),
+    };
+
+    debug!("Connected to remote destination");
+
+    // TODO: convert this to the real address
+    reply_sock
+        .write(&[
+            consts::SOCKS5_VERSION,
+            consts::SOCKS5_REPLY_SUCCEEDED,
+            0x00, // reserved
+            1,    // address type (ipv4, v6, domain)
+            127,  // ip
+            0,
+            0,
+            1,
+            0, // port
+            0,
+        ])
+        .await
+        .context("Can't write successful reply")?;
+
+    reply_sock.flush().await.context("Can't flush the reply!")?;
+
+    debug!("Wrote success");
+
+    transfer(reply_sock, outbound).await
+}
+
 /// Copy data between two peers
 /// Using 2 different generators, because they could be different structs with same traits.
-async fn transfer<I, O>(mut inbound: I, mut outbound: O) -> Result<()>
+pub async fn transfer<I, O>(mut inbound: I, mut outbound: O) -> Result<()>
 where
     I: AsyncRead + AsyncWrite + Unpin,
     O: AsyncRead + AsyncWrite + Unpin,
