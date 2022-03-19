@@ -7,10 +7,10 @@ use crate::util::stream::tcp_connect_with_timeout;
 use crate::Socks5Command;
 use crate::{consts, AuthenticationMethod, ReplyError, Result, SocksError};
 use anyhow::Context;
+use futures::future::BoxFuture;
 use std::future::Future;
 use std::io;
 use std::net::IpAddr;
-use std::net::Ipv4Addr;
 use std::net::{SocketAddr, ToSocketAddrs as StdToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,8 +21,14 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs as AsyncToSocketAddrs};
 use tokio::try_join;
 use tokio_stream::Stream;
 
+pub type ConnectCallback<T> =
+    Box<dyn Fn(Option<TargetAddr>, u64, &mut T) -> BoxFuture<Result<()>> + Send + Sync>;
+
+pub type UDPAssocCallback<T> =
+    Box<dyn Fn(Option<TargetAddr>, &mut T, IpAddr) -> BoxFuture<Result<()>> + Send + Sync>;
+
 #[derive(Clone)]
-pub struct Config {
+pub struct Config<T: AsyncRead + AsyncWrite + Unpin> {
     /// Timeout of the command request
     request_timeout: u64,
     /// Avoid useless roundtrips if we don't need the Authentication layer
@@ -31,18 +37,24 @@ pub struct Config {
     dns_resolve: bool,
     /// Enable command execution
     execute_command: bool,
+    /// Connect command callback. If None, use the default implementation.
+    connect_callback: Option<Arc<ConnectCallback<T>>>,
+    /// UDP assosiate command callback. If None, use the default implementation.
+    udp_assoc_callback: Option<Arc<UDPAssocCallback<T>>>,
     /// Enable UDP support
     allow_udp: bool,
     auth: Option<Arc<dyn Authentication>>,
 }
 
-impl Default for Config {
+impl<T: AsyncRead + AsyncWrite + Unpin> Default for Config<T> {
     fn default() -> Self {
         Config {
             request_timeout: 10,
             skip_auth: false,
             dns_resolve: true,
             execute_command: true,
+            connect_callback: None,
+            udp_assoc_callback: None,
             allow_udp: false,
             auth: None,
         }
@@ -66,7 +78,7 @@ impl Authentication for SimpleUserPassword {
     }
 }
 
-impl Config {
+impl<S: AsyncRead + AsyncWrite + Unpin> Config<S> {
     /// How much time it should wait until the request timeout.
     pub fn set_request_timeout(&mut self, n: u64) -> &mut Self {
         self.request_timeout = n;
@@ -97,6 +109,16 @@ impl Config {
         self
     }
 
+    pub fn set_connect_callback(&mut self, value: ConnectCallback<S>) -> &mut Self {
+        self.connect_callback = Some(Arc::new(value));
+        self
+    }
+
+    pub fn set_assoc_callback(&mut self, value: UDPAssocCallback<S>) -> &mut Self {
+        self.udp_assoc_callback = Some(Arc::new(value));
+        self
+    }
+
     /// Will the server perform dns resolve
     pub fn set_dns_resolve(&mut self, value: bool) -> &mut Self {
         self.dns_resolve = value;
@@ -114,7 +136,7 @@ impl Config {
 /// Useful if you don't use any existing TcpListener's streams.
 pub struct Socks5Server {
     listener: TcpListener,
-    config: Arc<Config>,
+    config: Arc<Config<TcpStream>>,
 }
 
 impl Socks5Server {
@@ -126,7 +148,7 @@ impl Socks5Server {
     }
 
     /// Set a custom config
-    pub fn set_config(&mut self, config: Config) {
+    pub fn set_config(&mut self, config: Config<TcpStream>) {
         self.config = Arc::new(config);
     }
 
@@ -178,7 +200,7 @@ impl<'a> Stream for Incoming<'a> {
 /// Wrap TcpStream and contains Socks5 protocol implementation.
 pub struct Socks5Socket<T: AsyncRead + AsyncWrite + Unpin> {
     inner: T,
-    config: Arc<Config>,
+    config: Arc<Config<T>>,
     auth: AuthenticationMethod,
     target_addr: Option<TargetAddr>,
     cmd: Option<Socks5Command>,
@@ -187,7 +209,7 @@ pub struct Socks5Socket<T: AsyncRead + AsyncWrite + Unpin> {
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Socks5Socket<T> {
-    pub fn new(socket: T, config: Arc<Config>) -> Self {
+    pub fn new(socket: T, config: Arc<Config<T>>) -> Self {
         Socks5Socket {
             inner: socket,
             config,
@@ -538,67 +560,49 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Socks5Socket<T> {
     /// Connect to the target address that the client wants,
     /// then forward the data between them (client <=> target address).
     async fn execute_command_connect(&mut self) -> Result<()> {
-        // async-std's ToSocketAddrs doesn't supports external trait implementation
-        // @see https://github.com/async-rs/async-std/issues/539
-        let addr = self
-            .target_addr
-            .as_ref()
-            .context("target_addr empty")?
-            .to_socket_addrs()?
-            .next()
-            .context("unreachable")?;
+        match &self.config.connect_callback {
+            Some(f) => {
+                f(
+                    self.target_addr.to_owned(),
+                    self.config.request_timeout,
+                    &mut self.inner,
+                )
+                .await?;
+            }
+            None => {
+                execute_command_connect_default(
+                    self.target_addr.to_owned(),
+                    self.config.request_timeout,
+                    &mut self.inner,
+                )
+                .await?;
+            }
+        };
 
-        // TCP connect with timeout, to avoid memory leak for connection that takes forever
-        let outbound = tcp_connect_with_timeout(addr, self.config.request_timeout).await?;
-
-        debug!("Connected to remote destination");
-
-        self.inner
-            .write(&new_reply(
-                &ReplyError::Succeeded,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
-            ))
-            .await
-            .context("Can't write successful reply")?;
-
-        self.inner.flush().await.context("Can't flush the reply!")?;
-
-        debug!("Wrote success");
-
-        transfer(&mut self.inner, outbound).await
+        Ok(())
     }
 
     /// Bind to a random UDP port, wait for the traffic from
     /// the client, and then forward the data to the remote addr.
     async fn execute_command_udp_assoc(&mut self) -> Result<()> {
-        // The DST.ADDR and DST.PORT fields contain the address and port that
-        // the client expects to use to send UDP datagrams on for the
-        // association. The server MAY use this information to limit access
-        // to the association.
-        // @see Page 6, https://datatracker.ietf.org/doc/html/rfc1928.
-        //
-        // We do NOT limit the access from the client currently in this implementation.
-        let _not_used = self.target_addr.as_ref();
-
-        // Listen with UDP6 socket, so the client can connect to it with either
-        // IPv4 or IPv6.
-        let peer_sock = UdpSocket::bind("[::]:0").await?;
-
-        // Respect the pre-populated reply IP address.
-        self.inner
-            .write(&new_reply(
-                &ReplyError::Succeeded,
-                SocketAddr::new(
+        match &self.config.udp_assoc_callback {
+            Some(f) => {
+                f(
+                    self.target_addr.to_owned(),
+                    &mut self.inner,
                     self.reply_ip.context("invalid reply ip")?,
-                    peer_sock.local_addr()?.port(),
-                ),
-            ))
-            .await
-            .context("Can't write successful reply")?;
-
-        debug!("Wrote success");
-
-        transfer_udp(peer_sock).await?;
+                )
+                .await?
+            }
+            None => {
+                execute_command_udp_assoc_default(
+                    self.target_addr.to_owned(),
+                    &mut self.inner,
+                    self.reply_ip.context("invalid reply ip")?,
+                )
+                .await?
+            }
+        };
 
         Ok(())
     }
@@ -623,6 +627,85 @@ where
         Ok(res) => info!("transfer closed ({}, {})", res.0, res.1),
         Err(err) => error!("transfer error: {:?}", err),
     };
+
+    Ok(())
+}
+
+/// Connect to the target address that the client wants,
+/// then forward the data between them (client <=> target address).
+async fn execute_command_connect_default<T: AsyncRead + AsyncWrite + Unpin>(
+    target_addr: Option<TargetAddr>,
+    request_timeout: u64,
+    reply_sock: &mut T,
+) -> Result<()> {
+    // async-std's ToSocketAddrs doesn't supports external trait implementation
+    // @see https://github.com/async-rs/async-std/issues/539
+    let addr = target_addr
+        .as_ref()
+        .context("target_addr empty")?
+        .to_socket_addrs()?
+        .next()
+        .context("unreachable")?;
+
+    // TCP connect with timeout, to avoid memory leak for connection that takes forever
+    let outbound = tcp_connect_with_timeout(addr, request_timeout).await?;
+    debug!("Connected to remote destination");
+
+    // TODO: convert this to the real address
+    reply_sock
+        .write(&[
+            consts::SOCKS5_VERSION,
+            consts::SOCKS5_REPLY_SUCCEEDED,
+            0x00, // reserved
+            1,    // address type (ipv4, v6, domain)
+            127,  // ip
+            0,
+            0,
+            1,
+            0, // port
+            0,
+        ])
+        .await
+        .context("Can't write successful reply")?;
+
+    reply_sock.flush().await.context("Can't flush the reply!")?;
+
+    debug!("Wrote success");
+
+    transfer(reply_sock, outbound).await
+}
+
+/// Reply the UDP associate request, and setup the tunnel.
+async fn execute_command_udp_assoc_default<T: AsyncRead + AsyncWrite + Unpin>(
+    target_addr: Option<TargetAddr>,
+    reply_sock: &mut T,
+    reply_ip: IpAddr,
+) -> Result<()> {
+    // The DST.ADDR and DST.PORT fields contain the address and port that
+    // the client expects to use to send UDP datagrams on for the
+    // association. The server MAY use this information to limit access
+    // to the association.
+    // @see Page 6, https://datatracker.ietf.org/doc/html/rfc1928.
+    //
+    // We do NOT limit the access from the client currently in this implementation.
+    let _not_used = target_addr;
+
+    // Listen with UDP6 socket, so the client can connect to it with either
+    // IPv4 or IPv6.
+    let peer_sock = UdpSocket::bind("[::]:0").await?;
+
+    // Respect the pre-populated reply IP address.
+    reply_sock
+        .write(&new_reply(
+            &ReplyError::Succeeded,
+            SocketAddr::new(reply_ip, peer_sock.local_addr()?.port()),
+        ))
+        .await
+        .context("Can't write successful reply")?;
+
+    debug!("Wrote success");
+
+    transfer_udp(peer_sock).await?;
 
     Ok(())
 }
